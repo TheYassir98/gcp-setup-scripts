@@ -1,198 +1,138 @@
 #!/bin/bash
+# Script para configurar el laboratorio GCP qwiklabs-gcp-03-4874b94ae8d1
 
-set -e
+# Variables de proyecto
+PROJECT_ID="qwiklabs-gcp-03-4874b94ae8d"
+PROJECT_NUMBER="865183104578"
+REGION_US="us-east1"
+REGION_ASIA="asia-east1"
+ZONE_US="us-east1-c"
 
-PROJECT_ID="tu-proyecto-id"
-REGION1="us-east1"
-ZONE1="us-east1-c"
-REGION2="asia-east1"
-ZONE2="asia-east1-a"
-
-# Autenticarse y seleccionar proyecto (opcional si ya está hecho)
+# Configura el proyecto activo
 gcloud config set project $PROJECT_ID
 
-echo "Task 1: Crear regla de firewall para health checks"
+echo "=== TASK 1: Configurar regla de firewall para health checks ==="
 gcloud compute firewall-rules create fw-allow-health-checks \
-  --network default \
-  --target-tags allow-health-checks \
-  --allow tcp:80 \
-  --source-ranges 130.211.0.0/22,35.191.0.0/16 \
-  --description "Allow health check probes from GCP ranges" \
-  --quiet
+    --network default \
+    --target-tags allow-health-checks \
+    --allow tcp:80 \
+    --source-ranges 130.211.0.0/22,35.191.0.0/16 \
+    --description "Allow health check probes to instances"
 
-echo "Task 2: Crear Cloud Router y configurar Cloud NAT"
+echo "=== TASK 2: Crear Cloud Router y Cloud NAT ==="
 gcloud compute routers create nat-router-us1 \
-  --network default \
-  --region $REGION1 \
-  --quiet
+    --network default \
+    --region $REGION_US \
+    --project $PROJECT_ID || echo "Router already exists"
 
 gcloud compute routers nats create nat-config \
-  --router=nat-router-us1 \
-  --router-region=$REGION1 \
-  --nat-all-subnet-ip-ranges \
-  --auto-allocate-nat-external-ips \
-  --enable-logging \
-  --quiet
+    --router=nat-router-us1 \
+    --router-region=$REGION_US \
+    --nat-all-subnet-ip-ranges \
+    --auto-allocate-nat-external-ips \
+    --project $PROJECT_ID || echo "NAT already exists"
 
-# Esperar a que NAT esté activo (simple espera)
-echo "Esperando 30 segundos para que Cloud NAT se inicie..."
+echo "=== TASK 3: Crear VM webserver y preparar imagen personalizada ==="
+gcloud compute instances create webserver \
+    --zone $ZONE_US \
+    --machine-type e2-micro \
+    --subnet default \
+    --tags allow-health-checks \
+    --no-address \
+    --image-family debian-11 \
+    --image-project debian-cloud \
+    --boot-disk-auto-delete=false
+
+# Espera a que la VM esté lista
+echo "Esperando que la VM webserver esté lista para SSH..."
 sleep 30
 
-echo "Task 3: Crear VM webserver sin IP externa y con Apache instalado"
+# Instalar apache2 y configurar para que inicie al boot
+gcloud compute ssh webserver --zone=$ZONE_US --command="
+    sudo apt-get update &&
+    sudo apt-get install -y apache2 &&
+    sudo service apache2 start &&
+    sudo update-rc.d apache2 enable
+"
 
-gcloud compute instances create webserver \
-  --zone=$ZONE1 \
-  --machine-type=e2-micro \
-  --network-tags=allow-health-checks \
-  --no-address \
-  --image-family=debian-11 \
-  --image-project=debian-cloud \
-  --boot-disk-auto-delete=no \
-  --quiet
+# Reiniciar VM para probar el autoarranque del apache
+gcloud compute instances reset webserver --zone=$ZONE_US
 
-echo "Instalando Apache en la VM 'webserver'..."
-gcloud compute ssh webserver --zone=$ZONE1 --command="sudo apt-get update && sudo apt-get install -y apache2 && sudo service apache2 start && sudo update-rc.d apache2 enable"
+# Esperar para que reinicie
+sleep 20
 
-echo "Reiniciando la VM para validar que apache arranque al inicio..."
-gcloud compute instances reset webserver --zone=$ZONE1 --quiet
+# Comprobar status apache (opcional)
+gcloud compute ssh webserver --zone=$ZONE_US --command="sudo service apache2 status"
 
-echo "Esperando 15 segundos para que la VM reinicie..."
-sleep 15
-
-echo "Verificando estado de apache en 'webserver'..."
-gcloud compute ssh webserver --zone=$ZONE1 --command="sudo service apache2 status"
-
-echo "Task 3: Crear imagen customizada del disco boot de webserver"
-DISK_NAME=$(gcloud compute instances describe webserver --zone=$ZONE1 --format="get(disks[0].deviceName)")
-echo "Usando disco boot: $DISK_NAME"
-
-# Detener instancia antes de crear imagen para evitar problemas
-gcloud compute instances stop webserver --zone=$ZONE1 --quiet
-sleep 10
-
+# Crear imagen personalizada desde el disco de webserver
+DISK_NAME=$(gcloud compute instances describe webserver --zone=$ZONE_US --format='get(disks[0].deviceName)')
 gcloud compute images create mywebserver \
-  --source-disk=$DISK_NAME \
-  --source-disk-zone=$ZONE1 \
-  --quiet
+    --source-disk=$DISK_NAME \
+    --source-disk-zone=$ZONE_US
 
-# Borrar la VM pero mantener disco
-gcloud compute instances delete webserver --zone=$ZONE1 --quiet
-
-echo "Task 4: Crear template de instancia"
-
+echo "=== TASK 4: Crear plantilla de instancia y grupos administrados ==="
 gcloud compute instance-templates create mywebserver-template \
-  --machine-type=e2-micro \
-  --network-tags=allow-health-checks \
-  --no-address \
-  --image=mywebserver \
-  --image-project=$PROJECT_ID \
-  --quiet
+    --machine-type e2-micro \
+    --network default \
+    --tags allow-health-checks \
+    --no-address \
+    --image mywebserver
 
-echo "Task 4: Crear health check TCP puerto 80"
-gcloud compute health-checks create tcp http-health-check --port 80 --quiet
-
-echo "Task 4: Crear grupos de instancias administradas con autoscaling"
+gcloud compute health-checks create tcp http-health-check --port 80
 
 gcloud compute instance-groups managed create us-1-mig \
-  --base-instance-name=us-1-mig \
-  --template=mywebserver-template \
-  --size=1 \
-  --zone=$ZONE1 \
-  --health-check=http-health-check \
-  --initial-delay=60 \
-  --quiet
+    --base-instance-name us-1-mig \
+    --template mywebserver-template \
+    --size 1 \
+    --zones us-east1-b,us-east1-c
 
 gcloud compute instance-groups managed set-autoscaling us-1-mig \
-  --max-num-replicas=2 \
-  --min-num-replicas=1 \
-  --target-load-balancing-utilization=0.8 \
-  --cool-down-period=60 \
-  --zone=$ZONE1 \
-  --quiet
+    --max-num-replicas 2 \
+    --min-num-replicas 1 \
+    --target-load-balancing-utilization 0.8 \
+    --cool-down-period 60 \
+    --zone us-east1-c
 
-# Para asia-east1:
 gcloud compute instance-groups managed create notus-1-mig \
-  --base-instance-name=notus-1-mig \
-  --template=mywebserver-template \
-  --size=1 \
-  --zone=$ZONE2 \
-  --health-check=http-health-check \
-  --initial-delay=60 \
-  --quiet
+    --base-instance-name notus-1-mig \
+    --template mywebserver-template \
+    --size 1 \
+    --zones asia-east1-b,asia-east1-c
 
 gcloud compute instance-groups managed set-autoscaling notus-1-mig \
-  --max-num-replicas=2 \
-  --min-num-replicas=1 \
-  --target-load-balancing-utilization=0.8 \
-  --cool-down-period=60 \
-  --zone=$ZONE2 \
-  --quiet
+    --max-num-replicas 2 \
+    --min-num-replicas 1 \
+    --target-load-balancing-utilization 0.8 \
+    --cool-down-period 60 \
+    --zone asia-east1-c
 
-echo "Task 5: Crear Load Balancer HTTP global"
-
+echo "=== TASK 5: Configurar Application Load Balancer (HTTP) ==="
 gcloud compute backend-services create http-backend \
-  --protocol=HTTP \
-  --port-name=http \
-  --health-checks=http-health-check \
-  --global \
-  --timeout=30 \
-  --quiet
+    --protocol HTTP \
+    --port-name http \
+    --health-checks http-health-check \
+    --global
 
 gcloud compute backend-services add-backend http-backend \
-  --instance-group=us-1-mig \
-  --instance-group-zone=$ZONE1 \
-  --global \
-  --balancing-mode=RATE \
-  --max-rate=50 \
-  --capacity-scaler=1.0 \
-  --quiet
+    --instance-group us-1-mig \
+    --instance-group-zone us-east1-c \
+    --global
 
 gcloud compute backend-services add-backend http-backend \
-  --instance-group=notus-1-mig \
-  --instance-group-zone=$ZONE2 \
-  --global \
-  --balancing-mode=UTILIZATION \
-  --max-utilization=0.8 \
-  --capacity-scaler=1.0 \
-  --quiet
+    --instance-group notus-1-mig \
+    --instance-group-zone asia-east1-c \
+    --global
 
-gcloud compute url-maps create web-map-http \
-  --default-service=http-backend \
-  --quiet
+gcloud compute url-maps create http-map \
+    --default-service http-backend
 
 gcloud compute target-http-proxies create http-lb-proxy \
-  --url-map=web-map-http \
-  --quiet
+    --url-map http-map
 
 gcloud compute forwarding-rules create http-content-rule-v4 \
-  --address=0.0.0.0 \
-  --global \
-  --target-http-proxy=http-lb-proxy \
-  --ports=80 \
-  --quiet
+    --address "" \
+    --global \
+    --target-http-proxy http-lb-proxy \
+    --ports 80
 
-gcloud compute forwarding-rules create http-content-rule-v6 \
-  --address=0.0.0.0 \
-  --global \
-  --target-http-proxy=http-lb-proxy \
-  --ports=80 \
-  --ip-version=IPV6 \
-  --quiet
-
-echo "Task 6: Crear VM para stress test"
-
-# Elegimos zona diferente, por ejemplo us-central1-a
-STRESS_REGION="us-central1"
-STRESS_ZONE="us-central1-a"
-
-gcloud compute instances create stress-test \
-  --zone=$STRESS_ZONE \
-  --machine-type=e2-micro \
-  --image=mywebserver \
-  --image-project=$PROJECT_ID \
-  --quiet
-
-echo "El script ha terminado. Revisa el estado de los recursos y el IP del load balancer con:"
-echo "gcloud compute forwarding-rules list --global"
-echo "Para stress test, conecta a la VM stress-test y corre: ab -n 500000 -c 1000 http://[LB_IP]/"
-
+echo "Script terminado. Verifica los recursos en la consola de Google Cloud."
